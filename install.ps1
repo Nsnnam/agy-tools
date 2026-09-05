@@ -26,12 +26,10 @@ $profileFunc = @"
 
 # Antigravity CLI Resume Tool
 function agyr {
-    param([string[]]`$argsList)
-    python "$targetScript" @argsList
+    python "$targetScript" `$args
 }
 function agy-resume {
-    param([string[]]`$argsList)
-    python "$targetScript" @argsList
+    python "$targetScript" `$args
 }
 "@
 
