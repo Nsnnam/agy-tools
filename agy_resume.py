@@ -8,14 +8,6 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 
-try:
-    import tkinter as tk
-    from tkinter import ttk, messagebox
-except ImportError:
-    tk = None
-    ttk = None
-    messagebox = None
-
 # Configure UTF-8 encoding for Windows console
 if sys.platform == "win32":
     try:
@@ -24,6 +16,17 @@ if sys.platform == "win32":
         sys.stdin.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+from datetime import datetime, timezone
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+except ImportError:
+    tk = None
+    ttk = None
+    messagebox = None
+    filedialog = None
 
 CLI_BASE_DIR = os.path.expandvars(r"%USERPROFILE%\.gemini\antigravity-cli")
 BRAIN_DIR = os.path.join(CLI_BASE_DIR, "brain")
@@ -84,7 +87,7 @@ def format_short_datetime(dt):
     return dt.strftime("%d/%m/%Y %H:%M")
 
 def load_custom_names():
-    """Tải danh sách tên dự án và tiêu đề tùy chỉnh do người dùng đặt."""
+    """Tải danh sách tên dự án, phiên bản, tiêu đề và thư mục tùy chỉnh."""
     if not os.path.exists(CUSTOM_NAMES_PATH):
         return {}
     try:
@@ -94,7 +97,7 @@ def load_custom_names():
         return {}
 
 def save_custom_names(data):
-    """Lưu danh sách tên dự án và tiêu đề tùy chỉnh ra file JSON."""
+    """Lưu danh sách cấu hình tùy chỉnh ra file JSON."""
     try:
         with open(CUSTOM_NAMES_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -103,9 +106,9 @@ def save_custom_names(data):
         print(f"Lỗi lưu custom names: {e}")
         return False
 
-def update_session_names(cid, new_project_name, new_title):
+def update_session_names(cid, new_project_name=None, new_title=None, new_version=None, new_cwd=None):
     """
-    Cập nhật Tên dự án (project_name) và Tiêu đề (title) cho phiên làm việc.
+    Cập nhật Tên dự án (project_name), Tiêu đề (title), Phiên bản (version) và Thư mục chính (cwd).
     Đồng bộ cả custom_project_names.json và SQLite conversation_summaries.db.
     """
     custom_names = load_custom_names()
@@ -114,11 +117,17 @@ def update_session_names(cid, new_project_name, new_title):
         
     clean_proj = new_project_name.strip() if new_project_name is not None else ""
     clean_title = new_title.strip() if new_title is not None else ""
+    clean_ver = new_version.strip() if new_version is not None else ""
+    clean_cwd = normalize_path(new_cwd) if new_cwd is not None else ""
     
     if clean_proj:
         custom_names[cid]["project_name"] = clean_proj
     if clean_title:
         custom_names[cid]["title"] = clean_title
+    if clean_ver:
+        custom_names[cid]["version"] = clean_ver
+    if clean_cwd:
+        custom_names[cid]["cwd"] = clean_cwd
         
     custom_names[cid]["updated_at"] = datetime.now(timezone.utc).isoformat()
     save_custom_names(custom_names)
@@ -135,6 +144,156 @@ def update_session_names(cid, new_project_name, new_title):
             print(f"Lỗi update summaries DB: {e}")
             
     return True
+
+def detect_project_version(cwd, transcript_path=None, custom_version=None):
+    """
+    Tự động nhận diện phiên bản tương ứng mới nhất của từng dự án/tool.
+    Quét từ:
+    1. Cấu hình người dùng đặt thủ công (custom_version)
+    2. package.json ("version")
+    3. manifest.json (Chrome Extension "version")
+    4. pyproject.toml / Cargo.toml / setup.py
+    5. VERSION / version.txt / version.json
+    6. Header file chính WordPress plugin (* Version: x.y.z)
+    7. Git commit log mới nhất (mẫu vX.Y.Z hoặc release: vX.Y.Z)
+    8. Git tags mới nhất
+    9. Nội dung trao đổi gần nhất trong transcript
+    """
+    if custom_version:
+        return custom_version
+
+    is_generic_home = False
+    if cwd:
+        norm_cwd = normalize_path(cwd).lower().rstrip(r"\/")
+        if norm_cwd in [DEFAULT_PROJECT_DIR.lower().rstrip(r"\/"), r"c:\users\admin"]:
+            is_generic_home = True
+
+    if cwd and os.path.isdir(cwd) and not is_generic_home:
+        # 1. package.json
+        p_json = os.path.join(cwd, "package.json")
+        if os.path.isfile(p_json):
+            try:
+                with open(p_json, "r", encoding="utf-8") as f:
+                    v = json.load(f).get("version")
+                    if v:
+                        v_str = str(v).strip()
+                        return v_str if v_str.startswith("v") else f"v{v_str}"
+            except Exception:
+                pass
+
+        # 2. manifest.json (Chrome Extension)
+        m_json = os.path.join(cwd, "manifest.json")
+        if os.path.isfile(m_json):
+            try:
+                with open(m_json, "r", encoding="utf-8") as f:
+                    v = json.load(f).get("version")
+                    if v:
+                        v_str = str(v).strip()
+                        return v_str if v_str.startswith("v") else f"v{v_str}"
+            except Exception:
+                pass
+
+        # 3. pyproject.toml
+        pyproj = os.path.join(cwd, "pyproject.toml")
+        if os.path.isfile(pyproj):
+            try:
+                with open(pyproj, "r", encoding="utf-8") as f:
+                    m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', f.read())
+                    if m:
+                        v_str = m.group(1).strip()
+                        return v_str if v_str.startswith("v") else f"v{v_str}"
+            except Exception:
+                pass
+
+        # 4. Cargo.toml
+        cargo = os.path.join(cwd, "Cargo.toml")
+        if os.path.isfile(cargo):
+            try:
+                with open(cargo, "r", encoding="utf-8") as f:
+                    m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', f.read())
+                    if m:
+                        v_str = m.group(1).strip()
+                        return v_str if v_str.startswith("v") else f"v{v_str}"
+            except Exception:
+                pass
+
+        # 5. VERSION or version.txt or version.json
+        for vname in ["VERSION", "version.txt", "version.json", "VERSION.md"]:
+            vp = os.path.join(cwd, vname)
+            if os.path.isfile(vp):
+                try:
+                    with open(vp, "r", encoding="utf-8") as f:
+                        c = f.read().strip()
+                        if vname.endswith(".json"):
+                            c = json.loads(c).get("version", "")
+                        m = re.search(r'v?(\d+\.\d+(?:\.\d+)?)', c)
+                        if m:
+                            return f"v{m.group(1)}"
+                except Exception:
+                    pass
+
+        # 6. WordPress plugin main file header
+        try:
+            for fname in os.listdir(cwd):
+                if fname.endswith(".php"):
+                    php_file = os.path.join(cwd, fname)
+                    with open(php_file, "r", encoding="utf-8", errors="ignore") as f:
+                        content_head = f.read(2048)
+                        m = re.search(r'Version:\s*([0-9\.]+)', content_head, re.IGNORECASE)
+                        if m:
+                            return f"v{m.group(1)}"
+        except Exception:
+            pass
+
+        # 7. Git commit messages / tags
+        if os.path.isdir(os.path.join(cwd, ".git")):
+            try:
+                res = subprocess.run(
+                    ["git", "-C", cwd, "log", "-n", "8", "--pretty=format:%s"],
+                    capture_output=True, text=True, timeout=2
+                )
+                if res.returncode == 0 and res.stdout:
+                    m = re.search(r'\b(?:v|release:\s*v?|ver\s*v?)(\d+\.\d+(?:\.\d+)?)\b', res.stdout, re.IGNORECASE)
+                    if m:
+                        return f"v{m.group(1)}"
+            except Exception:
+                pass
+
+            try:
+                res = subprocess.run(
+                    ["git", "-C", cwd, "describe", "--tags", "--abbrev=0"],
+                    capture_output=True, text=True, timeout=2
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    return res.stdout.strip()
+            except Exception:
+                pass
+
+    # 8. Transcript fallback (tìm mẫu phiên bản do user hoặc assistant xác nhận trực tiếp)
+    if transcript_path and os.path.isfile(transcript_path):
+        try:
+            with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+                matches = []
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        m_type = obj.get("type")
+                        if m_type in ["USER_INPUT", "PLANNER_RESPONSE"]:
+                            txt = clean_text(obj.get("content", ""))
+                            # Tìm mẫu: phiên bản v1.2.3 hoặc v1.2.3 hoặc release: v1.2.3
+                            found = re.findall(r'\b(?:phiên\s*bản|version|release)\s*[:=]?\s*v?(\d+\.\d+(?:\.\d+)?)\b', txt, re.IGNORECASE)
+                            if found:
+                                matches.extend(found)
+                    except Exception:
+                        pass
+                if matches:
+                    return f"v{matches[-1]}"
+        except Exception:
+            pass
+
+    return "-"
 
 def load_summaries_metadata():
     summaries = {}
@@ -270,6 +429,7 @@ def scan_sessions(limit=None):
                                         if c:
                                             c_norm = normalize_path(c)
                                             if c_norm and os.path.isdir(c_norm):
+                                                # Bỏ qua thư mục nội bộ CLI hoặc thư mục gốc user
                                                 if not c_norm.lower().startswith(CLI_BASE_DIR.lower()) and c_norm.lower() != DEFAULT_PROJECT_DIR.lower():
                                                     detected_cwd = c_norm
                                                     
@@ -295,7 +455,15 @@ def scan_sessions(limit=None):
                     detected_cwd = candidate_repo_path
                     break
                     
-        # Xác định tên dự án ban đầu
+        # Áp dụng cấu hình tùy chỉnh của người dùng nếu có
+        custom_entry = custom_names.get(cid, {})
+        if custom_entry.get("cwd"):
+            detected_cwd = custom_entry["cwd"]
+
+        # Xác định thư mục cuối cùng
+        final_cwd = normalize_path(detected_cwd or DEFAULT_PROJECT_DIR)
+
+        # Xác định tên dự án
         proj_name = "Chung (Home)"
         if detected_cwd:
             proj_name = os.path.basename(detected_cwd.rstrip(r"\/"))
@@ -318,17 +486,20 @@ def scan_sessions(limit=None):
             title = first_prompt[:50] if first_prompt else proj_name
 
         # Áp dụng Tên dự án & Tiêu đề tùy chỉnh nếu có
-        custom_entry = custom_names.get(cid, {})
         if custom_entry.get("project_name"):
             proj_name = custom_entry["project_name"]
         if custom_entry.get("title"):
             title = custom_entry["title"]
+
+        # Nhận diện phiên bản tương ứng mới nhất
+        version = detect_project_version(final_cwd, log_path, custom_version=custom_entry.get("version"))
 
         git_repo_str = ", ".join(git_repos)
 
         entries.append({
             "id": cid,
             "title": title,
+            "version": version,
             "parent_id": parent_id,
             "created_at": created_at,
             "created_at_str": format_datetime(created_at),
@@ -338,7 +509,7 @@ def scan_sessions(limit=None):
             "updated_iso": format_iso_datetime(updated_at),
             "turns": turns,
             "project_name": proj_name,
-            "cwd": normalize_path(detected_cwd or DEFAULT_PROJECT_DIR),
+            "cwd": final_cwd,
             "git_repos": git_repos,
             "git_repo_str": git_repo_str,
             "first_prompt": first_prompt,
@@ -359,40 +530,47 @@ def display_sessions(sessions):
     for idx, s in enumerate(sessions, 1):
         num_str = f"[{idx}]"
         parent_badge = f" {MAGENTA}[Nhánh từ: {s['parent_id'][:8]}]{RESET}" if s['parent_id'] else ""
-        print(f"{GREEN}{BOLD}{num_str:<5}{RESET} {YELLOW}{s['updated_at_str']}{RESET} | {CYAN}{BOLD}{s['project_name']}{RESET} ({s['turns']} lượt){parent_badge}")
-        print(f"      {BOLD}📌 Tiêu đề :{RESET} {s['title']}")
+        ver_str = f" {YELLOW}[{s.get('version', '-')}]" if s.get('version') and s.get('version') != '-' else ""
+        print(f"{GREEN}{BOLD}{num_str:<5}{RESET} {YELLOW}{s['updated_at_str']}{RESET} | {CYAN}{BOLD}{s['project_name']}{RESET}{ver_str}{RESET} ({s['turns']} lượt){parent_badge}")
+        print(f"      {BOLD}📌 Tiêu đề   :{RESET} {s['title']}")
+        if s.get('version') and s.get('version') != '-':
+            print(f"      {YELLOW}🏷️ Phiên bản :{RESET} {BOLD}{s['version']}{RESET}")
+        print(f"      {DIM}📁 Thư mục   :{RESET} {s['cwd']}")
         if s.get('git_repo_str'):
-            print(f"      {BLUE}🔗 Git Repo:{RESET} {s['git_repo_str']}")
-        print(f"      {DIM}🕒 Tạo lúc :{RESET} {s['created_at_str']} | {DIM}Sửa cuối:{RESET} {s['updated_at_str']}")
-        print(f"      {DIM}📁 Thư mục :{RESET} {s['cwd']}")
+            print(f"      {BLUE}🔗 Git Repo  :{RESET} {s['git_repo_str']}")
+        print(f"      {DIM}🕒 Tạo lúc   :{RESET} {s['created_at_str']} | {DIM}Sửa cuối:{RESET} {s['updated_at_str']}")
         
         # Display initial prompt
         fp = s['first_prompt'] or "(Chưa có)"
         if len(fp) > 115:
             fp = fp[:112] + "..."
-        print(f"      {BLUE}🌱 Khởi tạo:{RESET} {fp}")
+        print(f"      {BLUE}🌱 Khởi tạo  :{RESET} {fp}")
         
         # Display latest prompt
         lp = s['last_prompt'] or "(Chưa có)"
         if len(lp) > 115:
             lp = lp[:112] + "..."
-        print(f"      {GREEN}💬 Gần nhất:{RESET} {lp}")
+        print(f"      {GREEN}💬 Gần nhất  :{RESET} {lp}")
             
         print(f"      {DIM}🆔 ID: {s['id']}{RESET}")
         print(f"{DIM}----------------------------------------------------------------------{RESET}")
 
 def cli_rename_session(session):
-    """Đổi tên dự án và tiêu đề trực tiếp từ dòng lệnh."""
+    """Đổi tên dự án, phiên bản, tiêu đề và thư mục từ dòng lệnh."""
     cid = session["id"]
     curr_proj = session.get("project_name", "")
     curr_title = session.get("title", "")
+    curr_ver = session.get("version", "-")
+    curr_cwd = session.get("cwd", "")
     
     print(f"\n{CYAN}{BOLD}======================================================================{RESET}")
     print(f"{CYAN}{BOLD}              ĐỔI TÊN DỰ ÁN & TIÊU ĐỀ PHIÊN LÀM VIỆC                  {RESET}")
     print(f"{CYAN}{BOLD}======================================================================{RESET}")
     print(f"👉 {BOLD}ID           :{RESET} {cid}")
     print(f"👉 {BOLD}Dự án hiện tại:{RESET} {YELLOW}{curr_proj}{RESET}")
-    print(f"👉 {BOLD}Tiêu đề hiện tại:{RESET} {YELLOW}{curr_title}{RESET}\n")
+    print(f"👉 {BOLD}Phiên bản    :{RESET} {YELLOW}{curr_ver}{RESET}")
+    print(f"👉 {BOLD}Tiêu đề hiện tại:{RESET} {YELLOW}{curr_title}{RESET}")
+    print(f"👉 {BOLD}Thư mục chính:{RESET} {YELLOW}{curr_cwd}{RESET}\n")
     
     try:
         new_proj = input(f"{BOLD}📌 Nhập tên dự án mới [Enter để giữ '{curr_proj}']: {RESET}").strip()
@@ -401,21 +579,39 @@ def cli_rename_session(session):
         return
         
     try:
-        new_title = input(f"{BOLD}🏷️ Nhập tiêu đề mới [Enter để giữ '{curr_title}']: {RESET}").strip()
+        new_ver = input(f"{BOLD}🏷️ Nhập phiên bản mới [Enter để giữ '{curr_ver}']: {RESET}").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nĐã hủy.")
+        return
+        
+    try:
+        new_title = input(f"{BOLD}📝 Nhập tiêu đề mới [Enter để giữ '{curr_title}']: {RESET}").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nĐã hủy.")
+        return
+        
+    try:
+        new_cwd = input(f"{BOLD}📁 Nhập thư mục chính mới [Enter để giữ '{curr_cwd}']: {RESET}").strip()
     except (KeyboardInterrupt, EOFError):
         print("\nĐã hủy.")
         return
         
     final_proj = new_proj if new_proj else curr_proj
     final_title = new_title if new_title else curr_title
+    final_ver = new_ver if new_ver else curr_ver
+    final_cwd = new_cwd if new_cwd else curr_cwd
     
-    update_session_names(cid, final_proj, final_title)
+    update_session_names(cid, final_proj, final_title, final_ver, final_cwd)
     session["project_name"] = final_proj
     session["title"] = final_title
+    session["version"] = final_ver
+    session["cwd"] = final_cwd
     
     print(f"\n{GREEN}{BOLD}✅ Đã cập nhật thành công!{RESET}")
-    print(f"👉 {BOLD}Dự án mới :{RESET} {GREEN}{final_proj}{RESET}")
-    print(f"👉 {BOLD}Tiêu đề mới:{RESET} {GREEN}{final_title}{RESET}\n")
+    print(f"👉 {BOLD}Dự án mới   :{RESET} {GREEN}{final_proj}{RESET}")
+    print(f"👉 {BOLD}Phiên bản   :{RESET} {GREEN}{final_ver}{RESET}")
+    print(f"👉 {BOLD}Tiêu đề mới :{RESET} {GREEN}{final_title}{RESET}")
+    print(f"👉 {BOLD}Thư mục mới :{RESET} {GREEN}{final_cwd}{RESET}\n")
 
 def load_conversation_details(session):
     cid = session["id"]
@@ -500,7 +696,8 @@ def view_conversation(session):
     print(f"{CYAN}{BOLD}              CHI TIẾT CUỘC TRÒ CHUYỆN & CÁC CÂU HỎI                  {RESET}")
     print(f"{CYAN}{BOLD}======================================================================{RESET}")
     print(f"👉 {BOLD}Tiêu đề      :{RESET} {s['title']}")
-    print(f"👉 {BOLD}Dự án        :{RESET} {s['project_name']} | 📁 {s['cwd']}")
+    print(f"👉 {BOLD}Dự án        :{RESET} {s['project_name']} | 🏷️ {s.get('version', '-')}")
+    print(f"👉 {BOLD}Thư mục chính:{RESET} 📁 {s['cwd']}")
     if s.get('git_repo_str'):
         print(f"👉 {BOLD}Git Repo     :{RESET} {s['git_repo_str']}")
     print(f"👉 {BOLD}Conversation :{RESET} {s['id']}")
@@ -694,14 +891,16 @@ def resume_session(session):
     title = session.get("title", proj)
     
     print(f"\n{GREEN}{BOLD}🚀 Đang tiếp tục phiên làm việc...{RESET}")
-    print(f"👉 {BOLD}Tiêu đề:{RESET} {title}")
-    print(f"👉 {BOLD}Dự án  :{RESET} {proj}")
-    print(f"👉 {BOLD}Thư mục:{RESET} {cwd}")
-    print(f"👉 {BOLD}ID     :{RESET} {cid}")
+    print(f"👉 {BOLD}Tiêu đề      :{RESET} {title}")
+    print(f"👉 {BOLD}Dự án        :{RESET} {proj}")
+    if session.get("version") and session.get("version") != "-":
+        print(f"👉 {BOLD}Phiên bản    :{RESET} {session['version']}")
+    print(f"👉 {BOLD}Thư mục chính:{RESET} {cwd}")
+    print(f"👉 {BOLD}ID           :{RESET} {cid}")
     if session.get("git_repo_str"):
-        print(f"👉 {BOLD}Git    :{RESET} {session['git_repo_str']}")
+        print(f"👉 {BOLD}Git          :{RESET} {session['git_repo_str']}")
     if session.get("parent_id"):
-        print(f"👉 {BOLD}Nhánh từ:{RESET} {session['parent_id']}")
+        print(f"👉 {BOLD}Nhánh từ     :{RESET} {session['parent_id']}")
     print(f"{CYAN}{BOLD}======================================================================{RESET}\n")
 
     if os.path.isdir(cwd):
@@ -717,18 +916,18 @@ def resume_session(session):
         pass
 
 # ==============================================================================
-# GIAO DIỆN ĐỒ HỌA GUI (TKINTER) - ĐẦY ĐỦ CHỨC NĂNG & ĐỔI TÊN DỰ ÁN
+# GIAO DIỆN ĐỒ HỌA GUI (TKINTER) - ĐẦY ĐỦ CHỨC NĂNG, PHIÊN BẢN & LINK THƯ MỤC
 # ==============================================================================
 
 class RenameDialog:
-    """Hộp thoại đổi tên dự án và tiêu đề phiên làm việc trên GUI."""
+    """Hộp thoại đổi tên dự án, phiên bản, tiêu đề và thư mục chính trên GUI."""
     def __init__(self, parent, session, on_saved_callback):
         self.session = session
         self.on_saved = on_saved_callback
         
         self.top = tk.Toplevel(parent)
-        self.top.title("✏️ Đổi tên dự án & Tiêu đề - agyr")
-        self.top.geometry("560x390")
+        self.top.title("✏️ Cập nhật thông tin dự án & phiên làm việc - agyr")
+        self.top.geometry("620x520")
         self.top.resizable(False, False)
         self.top.transient(parent)
         self.top.grab_set()
@@ -739,7 +938,7 @@ class RenameDialog:
         ph = parent.winfo_height()
         px = parent.winfo_rootx()
         py = parent.winfo_rooty()
-        w, h = 560, 390
+        w, h = 620, 520
         x = px + max(0, (pw - w) // 2)
         y = py + max(0, (ph - h) // 2)
         self.top.geometry(f"{w}x{h}+{x}+{y}")
@@ -749,39 +948,70 @@ class RenameDialog:
         
         header_lbl = ttk.Label(
             main_frame,
-            text="✏️ ĐỔI TÊN DỰ ÁN & TIÊU ĐỀ PHIÊN LÀM VIỆC",
+            text="✏️ CẬP NHẬT THÔNG TIN DỰ ÁN & PHIÊN LÀM VIỆC",
             font=("Segoe UI", 11, "bold"),
             foreground="#0969da"
         )
         header_lbl.pack(anchor=tk.W, pady=(0, 10))
         
-        info_frame = ttk.LabelFrame(main_frame, text="Thông tin phiên", padding=8)
+        info_frame = ttk.LabelFrame(main_frame, text="Thông tin hệ thống", padding=8)
         info_frame.pack(fill=tk.X, pady=(0, 10))
         
         ttk.Label(info_frame, text=f"🆔 ID: {session['id']}", font=("Segoe UI", 8), foreground="#57606a").pack(anchor=tk.W)
-        cwd_disp = session.get('cwd', '')
-        if len(cwd_disp) > 65: cwd_disp = cwd_disp[:62] + "..."
-        ttk.Label(info_frame, text=f"📁 Thư mục: {cwd_disp}", font=("Segoe UI", 8), foreground="#57606a").pack(anchor=tk.W)
+        if session.get('git_repo_str'):
+            ttk.Label(info_frame, text=f"🔗 Git: {session['git_repo_str']}", font=("Segoe UI", 8), foreground="#0969da").pack(anchor=tk.W)
         
         # Form fields
         form_frame = ttk.Frame(main_frame)
         form_frame.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Label(form_frame, text="📌 Tên dự án mới (Hiển thị ở cột Dự án):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(4, 2))
-        self.ent_project = ttk.Entry(form_frame, font=("Segoe UI", 10))
-        self.ent_project.pack(fill=tk.X, pady=(0, 2))
-        self.ent_project.insert(0, session.get("project_name", ""))
-        ttk.Label(form_frame, text="   Ví dụ: Colophon Ebook, VNPT HIS, Extension Tự Động, Tool Excel...", font=("Segoe UI", 8), foreground="#656d76").pack(anchor=tk.W, pady=(0, 8))
+        # Row 1: Tên dự án & Phiên bản
+        row1_frame = ttk.Frame(form_frame)
+        row1_frame.pack(fill=tk.X, pady=(2, 4))
         
-        ttk.Label(form_frame, text="🏷️ Tiêu đề phiên mới (Hiển thị ở cột Tiêu đề):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(4, 2))
+        # Tên dự án
+        proj_col = ttk.Frame(row1_frame)
+        proj_col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Label(proj_col, text="📌 Tên dự án (Project Name):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(2, 2))
+        self.ent_project = ttk.Entry(proj_col, font=("Segoe UI", 10))
+        self.ent_project.pack(fill=tk.X)
+        self.ent_project.insert(0, session.get("project_name", ""))
+        
+        # Phiên bản
+        ver_col = ttk.Frame(row1_frame)
+        ver_col.pack(side=tk.RIGHT, fill=tk.X, padx=(0, 0))
+        ttk.Label(ver_col, text="🏷️ Phiên bản (Version):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(2, 2))
+        self.ent_version = ttk.Entry(ver_col, font=("Segoe UI", 10), width=16)
+        self.ent_version.pack(fill=tk.X)
+        curr_v = session.get("version", "")
+        self.ent_version.insert(0, "" if curr_v == "-" else curr_v)
+        
+        ttk.Label(form_frame, text="   Gợi ý phiên bản: v1.38.6, v2.1.0, 1.0.0... (hoặc để tự động nhận diện)", font=("Segoe UI", 8), foreground="#656d76").pack(anchor=tk.W, pady=(0, 8))
+        
+        # Row 2: Tiêu đề phiên
+        ttk.Label(form_frame, text="📝 Tiêu đề phiên (Title):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(2, 2))
         self.ent_title = ttk.Entry(form_frame, font=("Segoe UI", 10))
         self.ent_title.pack(fill=tk.X, pady=(0, 2))
         self.ent_title.insert(0, session.get("title", ""))
-        ttk.Label(form_frame, text="   Ví dụ: Tối ưu convert EPUB 54k sách, Sửa lỗi kết nối Apache...", font=("Segoe UI", 8), foreground="#656d76").pack(anchor=tk.W, pady=(0, 12))
+        ttk.Label(form_frame, text="   Mô tả ngắn mục tiêu phiên làm việc để dễ tìm kiếm", font=("Segoe UI", 8), foreground="#656d76").pack(anchor=tk.W, pady=(0, 8))
+        
+        # Row 3: Thư mục chính (CWD)
+        ttk.Label(form_frame, text="📁 Thư mục chính của dự án (Project Directory):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(2, 2))
+        cwd_frame = ttk.Frame(form_frame)
+        cwd_frame.pack(fill=tk.X, pady=(0, 2))
+        
+        self.ent_cwd = ttk.Entry(cwd_frame, font=("Segoe UI", 10))
+        self.ent_cwd.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.ent_cwd.insert(0, session.get("cwd", ""))
+        
+        btn_browse = ttk.Button(cwd_frame, text="📁 Duyệt...", command=self.browse_folder)
+        btn_browse.pack(side=tk.RIGHT)
+        
+        ttk.Label(form_frame, text="   Đường dẫn thư mục nguồn chính trên máy tính (sẽ được mở khi bấm link)", font=("Segoe UI", 8), foreground="#656d76").pack(anchor=tk.W, pady=(0, 12))
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
+        btn_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(8, 0))
         
         btn_cancel = ttk.Button(btn_frame, text="Hủy bỏ (Esc)", command=self.top.destroy)
         btn_cancel.pack(side=tk.RIGHT, padx=(6, 0))
@@ -795,19 +1025,34 @@ class RenameDialog:
         self.ent_project.focus_set()
         self.ent_project.select_range(0, tk.END)
 
+    def browse_folder(self):
+        initial = self.ent_cwd.get().strip() or DEFAULT_PROJECT_DIR
+        if not os.path.isdir(initial):
+            initial = DEFAULT_PROJECT_DIR
+        selected = filedialog.askdirectory(parent=self.top, initialdir=initial, title="Chọn thư mục chính của dự án")
+        if selected:
+            self.ent_cwd.delete(0, tk.END)
+            self.ent_cwd.insert(0, normalize_path(selected))
+
     def save(self):
         new_proj = self.ent_project.get().strip()
+        new_ver = self.ent_version.get().strip()
         new_title = self.ent_title.get().strip()
+        new_cwd = self.ent_cwd.get().strip()
         
         if not new_proj and not new_title:
             messagebox.showwarning("Thiếu thông tin", "Vui lòng nhập ít nhất Tên dự án hoặc Tiêu đề mới.", parent=self.top)
             return
             
-        update_session_names(self.session["id"], new_proj, new_title)
+        update_session_names(self.session["id"], new_proj, new_title, new_ver, new_cwd)
         if new_proj:
             self.session["project_name"] = new_proj
         if new_title:
             self.session["title"] = new_title
+        if new_ver:
+            self.session["version"] = new_ver
+        if new_cwd:
+            self.session["cwd"] = normalize_path(new_cwd)
             
         if self.on_saved:
             self.on_saved(self.session)
@@ -819,7 +1064,7 @@ class ViewDetailDialog:
     def __init__(self, parent, session):
         self.top = tk.Toplevel(parent)
         self.top.title(f"🔍 Chi tiết phiên: {session.get('project_name')} - {session.get('title')}")
-        self.top.geometry("850x600")
+        self.top.geometry("880x620")
         self.top.transient(parent)
         
         # Center dialog
@@ -828,7 +1073,7 @@ class ViewDetailDialog:
         ph = parent.winfo_height()
         px = parent.winfo_rootx()
         py = parent.winfo_rooty()
-        w, h = 850, 600
+        w, h = 880, 620
         x = px + max(0, (pw - w) // 2)
         y = py + max(0, (ph - h) // 2)
         self.top.geometry(f"{w}x{h}+{x}+{y}")
@@ -840,9 +1085,10 @@ class ViewDetailDialog:
         header_frame = ttk.LabelFrame(main_frame, text="Thông tin tổng quan", padding=8)
         header_frame.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(header_frame, text=f"📌 Dự án: {session.get('project_name')} | Tiêu đề: {session.get('title')}", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        ver_badge = f" [{session.get('version')}]" if session.get('version') and session.get('version') != '-' else ""
+        ttk.Label(header_frame, text=f"📌 Dự án: {session.get('project_name')}{ver_badge} | Tiêu đề: {session.get('title')}", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        ttk.Label(header_frame, text=f"📁 Thư mục chính: {session['cwd']}", font=("Segoe UI", 9)).pack(anchor=tk.W)
         ttk.Label(header_frame, text=f"🆔 Conversation ID: {session['id']}", font=("Segoe UI", 9)).pack(anchor=tk.W)
-        ttk.Label(header_frame, text=f"📁 Thư mục: {session['cwd']}", font=("Segoe UI", 9)).pack(anchor=tk.W)
         if session.get('git_repo_str'):
             ttk.Label(header_frame, text=f"🔗 Git Repo: {session['git_repo_str']}", font=("Segoe UI", 9), foreground="#0969da").pack(anchor=tk.W)
         ttk.Label(header_frame, text=f"🕒 Tạo lúc: {session['created_at_str']} | Cập nhật cuối: {session['updated_at_str']} | Lượt: {session['turns']}", font=("Segoe UI", 9), foreground="#57606a").pack(anchor=tk.W)
@@ -882,9 +1128,19 @@ class ViewDetailDialog:
             
         self.txt.config(state=tk.DISABLED)
         
-        btn_close = ttk.Button(main_frame, text="Đóng (Esc)", command=self.top.destroy)
-        btn_close.pack(side=tk.RIGHT, pady=(8, 0))
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(8, 0))
+        
+        btn_open = ttk.Button(btn_frame, text="📁 Mở thư mục dự án", command=lambda: self.open_folder(session['cwd']))
+        btn_open.pack(side=tk.LEFT)
+        
+        btn_close = ttk.Button(btn_frame, text="Đóng (Esc)", command=self.top.destroy)
+        btn_close.pack(side=tk.RIGHT)
         self.top.bind("<Escape>", lambda e: self.top.destroy())
+
+    def open_folder(self, cwd):
+        if cwd and os.path.isdir(cwd):
+            subprocess.Popen(["explorer", cwd])
 
 class BranchDialog:
     """Hộp thoại tạo phân nhánh (Fork) mới trên GUI."""
@@ -954,15 +1210,15 @@ class SessionManagerGUI:
         self.sort_desc = True
 
         self.root = tk.Tk()
-        self.root.title("Antigravity Session Manager (agyr) - Quản lý phiên làm việc")
-        self.root.geometry("1200x700")
-        self.root.minsize(900, 500)
+        self.root.title("Antigravity Session Manager (agyr) - Quản lý phiên làm việc & Dự án")
+        self.root.geometry("1280x720")
+        self.root.minsize(980, 520)
         
         # Căn giữa màn hình
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        w, h = 1200, 700
+        w, h = 1280, 720
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 2)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
@@ -989,27 +1245,27 @@ class SessionManagerGUI:
         ttk.Label(top_frame, text="🔍 Tìm kiếm:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(4, 4))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *args: self.filter_table())
-        self.search_entry = ttk.Entry(top_frame, textvariable=self.search_var, width=32, font=("Segoe UI", 9))
+        self.search_entry = ttk.Entry(top_frame, textvariable=self.search_var, width=30, font=("Segoe UI", 9))
         self.search_entry.pack(side=tk.LEFT, padx=(0, 2))
         
         btn_clear = ttk.Button(top_frame, text="✖", width=3, command=self.clear_search)
-        btn_clear.pack(side=tk.LEFT, padx=(0, 12))
+        btn_clear.pack(side=tk.LEFT, padx=(0, 10))
         
         # Action Buttons
         btn_resume = ttk.Button(top_frame, text="🚀 Tiếp tục (Enter)", command=self.on_resume)
         btn_resume.pack(side=tk.LEFT, padx=3)
         
-        btn_rename = ttk.Button(top_frame, text="✏️ Đổi tên dự án (F2)", command=self.on_rename)
+        btn_rename = ttk.Button(top_frame, text="✏️ Đổi tên / Sửa (F2)", command=self.on_rename)
         btn_rename.pack(side=tk.LEFT, padx=3)
+        
+        btn_folder = ttk.Button(top_frame, text="📁 Mở thư mục", command=self.on_open_folder)
+        btn_folder.pack(side=tk.LEFT, padx=3)
         
         btn_branch = ttk.Button(top_frame, text="🌿 Phân nhánh", command=self.on_branch)
         btn_branch.pack(side=tk.LEFT, padx=3)
         
         btn_view = ttk.Button(top_frame, text="🔍 Xem chi tiết", command=self.on_view_details)
         btn_view.pack(side=tk.LEFT, padx=3)
-        
-        btn_folder = ttk.Button(top_frame, text="📁 Mở thư mục", command=self.on_open_folder)
-        btn_folder.pack(side=tk.LEFT, padx=3)
         
         btn_refresh = ttk.Button(top_frame, text="🔄 Làm mới", command=self.on_refresh)
         btn_refresh.pack(side=tk.RIGHT, padx=4)
@@ -1018,29 +1274,32 @@ class SessionManagerGUI:
         tree_frame = ttk.Frame(self.root, padding=(8, 0, 8, 4))
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        cols = ("stt", "project", "title", "updated", "turns", "git", "last_prompt", "cwd", "id")
+        # Cột: STT, Dự án, Phiên bản, Tiêu đề, Thư mục chính, Cập nhật, Lượt, Git Repo, Yêu cầu gần nhất, ID
+        cols = ("stt", "project", "version", "title", "cwd_link", "updated", "turns", "git", "last_prompt", "id")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
         
-        # Setup Columns & Headings (with sort click)
+        # Setup Columns & Headings (hỗ trợ click để sort)
         self.tree.heading("stt", text="#", command=lambda: self.sort_by("stt"))
         self.tree.heading("project", text="📌 Dự án", command=lambda: self.sort_by("project"))
-        self.tree.heading("title", text="🏷️ Tiêu đề", command=lambda: self.sort_by("title"))
+        self.tree.heading("version", text="🏷️ Phiên bản", command=lambda: self.sort_by("version"))
+        self.tree.heading("title", text="📝 Tiêu đề", command=lambda: self.sort_by("title"))
+        self.tree.heading("cwd_link", text="📁 Thư mục chính (Click để mở)", command=lambda: self.sort_by("cwd_link"))
         self.tree.heading("updated", text="🕒 Ngày cập nhật", command=lambda: self.sort_by("updated"))
         self.tree.heading("turns", text="Lượt", command=lambda: self.sort_by("turns"))
         self.tree.heading("git", text="🔗 Git Repo", command=lambda: self.sort_by("git"))
         self.tree.heading("last_prompt", text="💬 Yêu cầu gần nhất", command=lambda: self.sort_by("last_prompt"))
-        self.tree.heading("cwd", text="📁 Thư mục", command=lambda: self.sort_by("cwd"))
         self.tree.heading("id", text="🆔 ID", command=lambda: self.sort_by("id"))
         
-        self.tree.column("stt", width=45, anchor="center")
-        self.tree.column("project", width=175, anchor="w")
-        self.tree.column("title", width=230, anchor="w")
-        self.tree.column("updated", width=140, anchor="center")
-        self.tree.column("turns", width=50, anchor="center")
-        self.tree.column("git", width=180, anchor="w")
-        self.tree.column("last_prompt", width=260, anchor="w")
-        self.tree.column("cwd", width=170, anchor="w")
-        self.tree.column("id", width=105, anchor="center")
+        self.tree.column("stt", width=42, anchor="center")
+        self.tree.column("project", width=165, anchor="w")
+        self.tree.column("version", width=85, anchor="center")
+        self.tree.column("title", width=220, anchor="w")
+        self.tree.column("cwd_link", width=225, anchor="w")
+        self.tree.column("updated", width=135, anchor="center")
+        self.tree.column("turns", width=45, anchor="center")
+        self.tree.column("git", width=175, anchor="w")
+        self.tree.column("last_prompt", width=250, anchor="w")
+        self.tree.column("id", width=95, anchor="center")
         
         # Alternating row colors
         self.tree.tag_configure("odd", background="#ffffff")
@@ -1064,11 +1323,11 @@ class SessionManagerGUI:
         self.lbl_status = ttk.Label(status_frame, text="", font=("Segoe UI", 9))
         self.lbl_status.pack(side=tk.LEFT)
         
-        self.lbl_msg = ttk.Label(status_frame, text="Sẵn sàng (Nhấn F2 hoặc bấm nút để đổi tên dự án)", font=("Segoe UI", 9), foreground="#0969da")
+        self.lbl_msg = ttk.Label(status_frame, text="Sẵn sàng (Nhấn F2 để đổi tên/phiên bản, double-click cột Thư mục để mở Explorer)", font=("Segoe UI", 9), foreground="#0969da")
         self.lbl_msg.pack(side=tk.RIGHT)
         
         # Event Bindings
-        self.tree.bind("<Double-1>", lambda e: self.on_resume())
+        self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<Return>", lambda e: self.on_resume())
         self.tree.bind("<F2>", lambda e: self.on_rename())
         self.tree.bind("<<TreeviewSelect>>", self.on_selection_change)
@@ -1077,12 +1336,13 @@ class SessionManagerGUI:
         # Context Menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="🚀 Tiếp tục phiên này (Enter)", command=self.on_resume)
-        self.context_menu.add_command(label="✏️ Đổi tên dự án / Tiêu đề (F2)", command=self.on_rename)
+        self.context_menu.add_command(label="📁 Mở thư mục chính trong Explorer", command=self.on_open_folder)
+        self.context_menu.add_command(label="✏️ Đổi tên dự án / Phiên bản / Tiêu đề (F2)", command=self.on_rename)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="🌿 Tạo phân nhánh mới (Branch)", command=self.on_branch)
         self.context_menu.add_command(label="🔍 Xem chi tiết lịch sử câu hỏi", command=self.on_view_details)
-        self.context_menu.add_command(label="📁 Mở thư mục dự án trong Explorer", command=self.on_open_folder)
         self.context_menu.add_separator()
+        self.context_menu.add_command(label="📋 Sao chép đường dẫn thư mục chính", command=self.on_copy_cwd)
         self.context_menu.add_command(label="📋 Sao chép Conversation ID", command=self.on_copy_id)
         self.context_menu.add_command(label="📋 Sao chép lệnh tiếp tục (agy --conversation ...)", command=self.on_copy_cmd)
 
@@ -1091,15 +1351,17 @@ class SessionManagerGUI:
         for idx, s in enumerate(sessions_to_show, 1):
             tag = "even" if idx % 2 == 0 else "odd"
             parent_badge = f" [Nhánh: {s['parent_id'][:6]}]" if s.get('parent_id') else ""
+            ver_text = s.get("version", "-")
             self.tree.insert("", "end", iid=s["id"], tags=(tag,), values=(
                 idx,
                 s.get("project_name", "") + parent_badge,
+                ver_text,
                 s.get("title", ""),
+                s.get("cwd", ""),
                 s.get("updated_iso", ""),
                 s.get("turns", 0),
                 s.get("git_repo_str", ""),
                 (s.get("last_prompt", "") or "")[:150],
-                s.get("cwd", ""),
                 s.get("id", "")[:12] + "..."
             ))
             
@@ -1118,6 +1380,7 @@ class SessionManagerGUI:
             self.filtered_sessions = [
                 s for s in self.sessions
                 if q in s.get("project_name", "").lower()
+                or q in s.get("version", "").lower()
                 or q in s.get("title", "").lower()
                 or q in s.get("git_repo_str", "").lower()
                 or q in s.get("cwd", "").lower()
@@ -1142,12 +1405,13 @@ class SessionManagerGUI:
         key_map = {
             "stt": lambda s: 0,
             "project": lambda s: s.get("project_name", "").lower(),
+            "version": lambda s: s.get("version", "").lower(),
             "title": lambda s: s.get("title", "").lower(),
+            "cwd_link": lambda s: s.get("cwd", "").lower(),
             "updated": lambda s: s.get("updated_iso", ""),
             "turns": lambda s: s.get("turns", 0),
             "git": lambda s: s.get("git_repo_str", "").lower(),
             "last_prompt": lambda s: s.get("last_prompt", "").lower(),
-            "cwd": lambda s: s.get("cwd", "").lower(),
             "id": lambda s: s.get("id", "").lower()
         }
         
@@ -1169,7 +1433,19 @@ class SessionManagerGUI:
         if s:
             disp_cwd = s.get('cwd', '')
             if len(disp_cwd) > 40: disp_cwd = disp_cwd[:37] + "..."
-            self.lbl_msg.config(text=f"Dự án: {s.get('project_name')} | ID: {s['id'][:12]}... | Thư mục: {disp_cwd}")
+            ver_text = f" | Phiên bản: {s.get('version')}" if s.get('version') and s.get('version') != '-' else ""
+            self.lbl_msg.config(text=f"Dự án: {s.get('project_name')}{ver_text} | Thư mục: {disp_cwd}")
+
+    def on_double_click(self, event):
+        # Kiểm tra xem người dùng double click vào cột nào
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "cell":
+            col = self.tree.identify_column(event.x)
+            # Cột #5 là cột "cwd_link" (Thư mục chính)
+            if col == "#5":
+                self.on_open_folder()
+                return
+        self.on_resume()
 
     def on_right_click(self, event):
         item = self.tree.identify_row(event.y)
@@ -1189,7 +1465,7 @@ class SessionManagerGUI:
     def on_rename(self):
         s = self.get_selected_session()
         if not s:
-            messagebox.showinfo("Thông báo", "Vui lòng chọn một phiên làm việc để đổi tên.", parent=self.root)
+            messagebox.showinfo("Thông báo", "Vui lòng chọn một phiên làm việc để cập nhật thông tin.", parent=self.root)
             return
             
         def on_saved(updated_session):
@@ -1198,9 +1474,12 @@ class SessionManagerGUI:
             if self.tree.exists(sel_id):
                 vals = list(self.tree.item(sel_id, "values"))
                 vals[1] = updated_session.get("project_name", "")
-                vals[2] = updated_session.get("title", "")
+                vals[2] = updated_session.get("version", "-")
+                vals[3] = updated_session.get("title", "")
+                vals[4] = updated_session.get("cwd", "")
                 self.tree.item(sel_id, values=vals)
-            self.lbl_msg.config(text=f"✅ Đã đổi tên thành công: {updated_session.get('project_name')} - {updated_session.get('title')}")
+            ver_str = f" [{updated_session.get('version')}]" if updated_session.get('version') and updated_session.get('version') != '-' else ""
+            self.lbl_msg.config(text=f"✅ Đã cập nhật thành công: {updated_session.get('project_name')}{ver_str} - {updated_session.get('title')}")
             
         RenameDialog(self.root, s, on_saved)
 
@@ -1235,11 +1514,18 @@ class SessionManagerGUI:
         if os.path.isdir(cwd):
             try:
                 subprocess.Popen(["explorer", cwd])
-                self.lbl_msg.config(text=f"📁 Đã mở thư mục: {cwd}")
+                self.lbl_msg.config(text=f"📁 Đã mở thư mục chính: {cwd}")
             except Exception as e:
                 messagebox.showerror("Lỗi", f"Không thể mở thư mục: {e}", parent=self.root)
         else:
             messagebox.showwarning("Cảnh báo", f"Thư mục không tồn tại: {cwd}", parent=self.root)
+
+    def on_copy_cwd(self):
+        s = self.get_selected_session()
+        if s and s.get("cwd"):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(s["cwd"])
+            self.lbl_msg.config(text=f"📋 Đã sao chép đường dẫn: {s['cwd']}")
 
     def on_copy_id(self):
         s = self.get_selected_session()
@@ -1266,7 +1552,7 @@ class SessionManagerGUI:
 def run_gui_app(sessions):
     """
     Khởi chạy giao diện Tkinter GUI tương tác hiện đại.
-    Hỗ trợ đổi tên dự án, tìm kiếm thời gian thực, xem chi tiết, phân nhánh và tiếp tục phiên.
+    Hỗ trợ đổi tên dự án, xem phiên bản, mở thư mục chính, tìm kiếm, phân nhánh và tiếp tục phiên.
     Nếu môi trường không hỗ trợ Tkinter thì tự động fallback về Out-GridView.
     """
     if tk is None:
@@ -1285,21 +1571,23 @@ def run_gui_app(sessions):
 def run_gui_grid(sessions):
     """
     Hiển thị giao diện GUI bảng chọn Out-GridView của PowerShell (Fallback).
+    Bao gồm cột PhienBan và ThuMucChinh.
     """
     items = []
     for idx, s in enumerate(sessions, 1):
         items.append({
             "STT": idx,
             "DuAn": s['project_name'],
+            "PhienBan": s.get('version', '-'),
+            "ThuMucChinh": s['cwd'],
             "TieuDe": s.get('title') or s.get('project_name'),
             "NgayCapNhat": s['updated_iso'],
             "NgayTao": s['created_iso'],
             "SoLuot": s['turns'],
+            "GitRepo": s.get('git_repo_str') or "",
             "YeuCauGanNhat": (s['last_prompt'] or "")[:350],
             "PhanHoiCuoi": (s.get('last_assistant') or "")[:350],
             "YeuCauBanDau": (s['first_prompt'] or "")[:250],
-            "GitRepo": s.get('git_repo_str') or "",
-            "ThuMuc": s['cwd'],
             "NhanhGoc": s.get('parent_id') or "",
             "ConversationId": s['id']
         })
@@ -1437,6 +1725,7 @@ def main():
         matched = [
             s for s in sessions 
             if query in s['project_name'].lower() 
+            or query in s.get('version', '').lower()
             or query in s['title'].lower() 
             or query in s['last_prompt'].lower() 
             or query in s['first_prompt'].lower()
@@ -1460,10 +1749,10 @@ def main():
     
     print(f"\n{BOLD}Tuỳ chọn thao tác:{RESET}")
     print(f"- {GREEN}1 - {len(displayed)}{RESET} hoặc {GREEN}[Enter]{RESET}    : Tiếp tục phiên [1]")
-    print(f"- {YELLOW}rn <số>{RESET} (ví dụ: {YELLOW}rn 3{RESET})   : ✏️ Đổi tên dự án & tiêu đề phiên")
-    print(f"- {CYAN}v <số>{RESET} (ví dụ: {CYAN}v 3{RESET})    : Xem chi tiết câu hỏi & lịch sử phiên")
-    print(f"- {MAGENTA}b <số>{RESET} (ví dụ: {MAGENTA}b 3{RESET})    : Tạo phân nhánh mới (Branch/Fork)")
-    print(f"- {BLUE}<từ khóa>{RESET}             : Tìm kiếm (tên dự án, tiêu đề, git repo, nội dung...)")
+    print(f"- {YELLOW}rn <số>{RESET} (ví dụ: {YELLOW}rn 1{RESET})   : ✏️ Đổi tên dự án, phiên bản & tiêu đề")
+    print(f"- {CYAN}v <số>{RESET} (ví dụ: {CYAN}v 1{RESET})    : Xem chi tiết câu hỏi & lịch sử phiên")
+    print(f"- {MAGENTA}b <số>{RESET} (ví dụ: {MAGENTA}b 1{RESET})    : Tạo phân nhánh mới (Branch/Fork)")
+    print(f"- {BLUE}<từ khóa>{RESET}             : Tìm kiếm (tên dự án, phiên bản, tiêu đề, git, nội dung...)")
     print(f"- {MAGENTA}all{RESET}                      : Xem toàn bộ {len(sessions)} phiên làm việc")
     print(f"- {MAGENTA}g{RESET}                        : Mở giao diện đồ họa GUI (Session Manager)")
     print(f"- {YELLOW}q{RESET}                        : Thoát\n")
@@ -1533,6 +1822,7 @@ def main():
             results = [
                 s for s in sessions 
                 if q in s['project_name'].lower() 
+                or q in s.get('version', '').lower()
                 or q in s['title'].lower() 
                 or q in s['last_prompt'].lower() 
                 or q in s['first_prompt'].lower()

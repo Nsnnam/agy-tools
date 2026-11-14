@@ -17,4 +17,5 @@ desktop.ini
 
 # Temp files
 *.tmp
+*.log
 agy_resume_temp.json
